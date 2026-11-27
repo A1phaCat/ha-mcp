@@ -31,7 +31,6 @@ from ha_mcp.tools.util_helpers import (
     get_logger_levels,
     is_single_entity_target,
     normalize_log_level,
-    project_repair_fields,
 )
 
 from ._command_faults import dropped_on, pooled_socket
@@ -428,34 +427,6 @@ class TestFilterActiveRepairs:
 
         assert filter_active_repairs(issues) == []
         assert filter_active_repairs(issues, include_dismissed=True) == []
-
-
-class TestProjectRepairFields:
-    """Projection keeps dismissal-state fields and drops verbose ones."""
-
-    async def test_keeps_dismissal_state_and_drops_verbose_fields(
-        self, hass: HomeAssistant, core_client: HomeAssistantClient
-    ) -> None:
-        _create_issue(
-            hass,
-            "x",
-            issue_domain="automation",
-            learn_more_url="https://example.com",
-            translation_placeholders={"x": "y"},
-        )
-        ir.async_ignore_issue(hass, "demo", "x", True)
-        [issue] = await _listed_issues(hass, core_client)
-
-        out = project_repair_fields(issue)
-
-        assert out["ignored"] is True
-        assert out["dismissed_version"] is not None
-        assert out["dismissed_version"] == issue["dismissed_version"]
-        assert out["is_fixable"] is False
-        assert out["issue_domain"] == "automation"
-        # Verbose fields dropped to keep overview payloads compact
-        assert "translation_placeholders" not in out
-        assert "learn_more_url" not in out
 
 
 @pytest.fixture

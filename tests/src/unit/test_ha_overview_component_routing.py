@@ -27,6 +27,7 @@ import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.service import async_set_service_schema
 from homeassistant.setup import async_setup_component
 
 from custom_components.ha_mcp_tools import websocket_api as component_ws_api
@@ -173,6 +174,41 @@ class TestRouting:
         assert resp["system_info"]["version"] == hass.config.as_dict()["version"]
         assert _total(spies) == 0
         assert _overview_frames(sent) == 1
+
+    async def test_component_passes_core_config_through(
+        self,
+        hass: HomeAssistant,
+        client: HomeAssistantClient,
+        component: HomeAssistantClient,
+        socket: HomeAssistantWebSocketClient,
+    ) -> None:
+        """The component does not maintain a second list of Core config keys."""
+        response = await socket.send_command(_OVERVIEW)
+
+        assert response["result"]["config"] == hass.config.as_dict()
+
+    async def test_ai_insights_use_native_service_entity_targets(
+        self,
+        hass: HomeAssistant,
+        client: HomeAssistantClient,
+        component: HomeAssistantClient,
+    ) -> None:
+        """A targetable entity domain is controllable without a copied allowlist."""
+
+        async def handle_service(_call: Any) -> None:
+            return None
+
+        hass.services.async_register("fan", "set_direction", handle_service)
+        async_set_service_schema(
+            hass,
+            "fan",
+            "set_direction",
+            {"target": {"entity": {"domain": "fan"}}},
+        )
+
+        response, _ = await _overview(client)
+
+        assert "fan" in response["ai_insights"]["controllable_devices"]
 
     async def test_a_component_without_child_device_semantics_uses_legacy(
         self,

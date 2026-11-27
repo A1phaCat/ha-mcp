@@ -419,7 +419,13 @@ from .lookups import (
     do_device_get,
 )
 from .oauth_callbacks import command_specs as _oauth_callback_specs
-from .overview import _do_overview, _do_states, _helpers_list_prep, do_helpers_list
+from .overview import (
+    _do_overview,
+    _do_states,
+    _helpers_list_prep,
+    _overview_prep,
+    do_helpers_list,
+)
 from .registries import _do_registries, _do_registry_fields
 from .schemas import (
     _blueprint_get_schema,
@@ -526,7 +532,7 @@ def _command_specs() -> list[tuple[dict[Any, Any], Any, Any]]:
     return [
         (_info_schema(), lambda hass, msg: do_info(hass), None),
         (_search_schema(), do_search, _search_prep),
-        (_overview_schema(), _do_overview, None),
+        (_overview_schema(), _do_overview, _overview_prep),
         (_helpers_list_schema(), do_helpers_list, _helpers_list_prep),
         (_states_schema(), _do_states, None),
         (_blueprint_get_schema(), _do_blueprint_get, _blueprint_get_prep),

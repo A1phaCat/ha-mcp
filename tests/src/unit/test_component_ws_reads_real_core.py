@@ -16,7 +16,6 @@ from unittest.mock import patch
 import pytest
 from homeassistant.components import persistent_notification
 from homeassistant.components.homeassistant import exposed_entities
-from homeassistant.const import __version__
 from homeassistant.core import HomeAssistant, State
 from homeassistant.core_config import async_process_ha_core_config
 from homeassistant.exceptions import HomeAssistantError
@@ -28,6 +27,7 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers import label_registry as lr
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.json import json_dumps
+from homeassistant.helpers.service import async_get_all_descriptions
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant.common import MockConfigEntry
 from pytest_homeassistant.typing import MockHAClientWebSocket
@@ -336,10 +336,10 @@ async def test_overview_returns_each_raw_slice_the_server_reads(
 
     state = next(s for s in result["states"] if s["entity_id"] == "light.lamp")
     assert (state["state"], state["attributes"]["friendly_name"]) == ("on", "Lamp")
-    names = hass.services.async_services()["input_boolean"]
+    descriptions = await async_get_all_descriptions(hass)
     assert {
         "domain": "input_boolean",
-        "services": {name: {} for name in names},
+        "services": descriptions["input_boolean"],
     } in result["services"]
     (entity,) = result["entity_registry"]
     assert (entity["entity_id"], entity["area_id"]) == ("light.lamp", home["office"])
@@ -361,12 +361,7 @@ async def test_overview_returns_each_raw_slice_the_server_reads(
     assert result["area_registry"] == [
         {"area_id": home["office"], "name": "Office", "floor_id": home["floor"]}
     ]
-    # Home Assistant's own config fields; the server supplies base_url.
-    assert result["config"]["version"] == __version__
-    assert result["config"]["location_name"] == hass.config.location_name
-    assert "base_url" not in result["config"]
-    allowlist = result["config"]["allowlist_external_dirs"]
-    assert sorted(allowlist) == sorted(hass.config.allowlist_external_dirs)
+    assert result["config"] == hass.config.as_dict()
     core_notes = await ws_result(component_ws, "persistent_notification/get")
     assert result["notifications"] == [
         {

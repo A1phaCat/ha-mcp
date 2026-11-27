@@ -13,6 +13,8 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from homeassistant.components import websocket_api
+from homeassistant.components.frontend import websocket_get_translations
 from homeassistant.config_entries import ConfigEntryDisabler
 from homeassistant.const import EVENT_HOMEASSISTANT_FINAL_WRITE, __version__
 from homeassistant.core import HomeAssistant
@@ -44,23 +46,29 @@ def _raise(
     hass: HomeAssistant,
     issue_id: str,
     *,
+    domain: str = "demo",
     ignored: bool = False,
     fixable: bool = True,
     persistent: bool = False,
     config_entry_id: str | None = None,
+    learn_more_url: str | None = None,
+    translation_key: str = "demo_issue",
+    translation_placeholders: dict[str, str] | None = None,
 ) -> None:
     ir.async_create_issue(
         hass,
-        "demo",
+        domain,
         issue_id,
         config_entry_id=config_entry_id,
         is_fixable=fixable,
         is_persistent=persistent,
+        learn_more_url=learn_more_url,
         severity=ir.IssueSeverity.WARNING,
-        translation_key="demo_issue",
+        translation_key=translation_key,
+        translation_placeholders=translation_placeholders,
     )
     if ignored:
-        ir.async_ignore_issue(hass, "demo", issue_id, True)
+        ir.async_ignore_issue(hass, domain, issue_id, True)
 
 
 async def _overview(client: HomeAssistantClient, **kwargs: Any) -> dict[str, Any]:
@@ -69,6 +77,29 @@ async def _overview(client: HomeAssistantClient, **kwargs: Any) -> dict[str, Any
 
 def _ids(result: dict[str, Any]) -> set[str]:
     return {repair["issue_id"] for repair in result["repairs"]}
+
+
+@pytest.fixture
+def translated_repair(hass: HomeAssistant) -> str:
+    """A real Core issue whose shipped text contains one placeholder."""
+    entries_url = "https://example.test/config/integrations"
+    _raise(
+        hass,
+        "removed",
+        domain="flipr",
+        learn_more_url="https://example.test/learn-more",
+        translation_key="integration_removed",
+        translation_placeholders={"entries": entries_url},
+    )
+    return entries_url
+
+
+def _assert_translated_issue(result: dict[str, Any], entries_url: str) -> None:
+    [issue] = result["repairs"]
+    assert issue["learn_more_url"] == "https://example.test/learn-more"
+    assert issue["translation_placeholders"] == {"entries": entries_url}
+    assert issue["title"] == "The Flipr integration has been removed"
+    assert entries_url in issue["description"]
 
 
 async def test_dismissed_repairs_are_left_out_and_counted_apart(
@@ -127,6 +158,38 @@ async def test_each_repair_shows_its_dismissal_state(
     assert by_id["dismissed_one"]["ignored"] is True
     # Core records the running version as the one the repair was dismissed in.
     assert by_id["dismissed_one"]["dismissed_version"] == __version__
+
+
+async def test_component_keeps_core_fields_and_resolves_native_issue_text(
+    component_core_client: HomeAssistantClient,
+    repairs: None,
+    translated_repair: str,
+) -> None:
+    """Core's issue row and translations survive the component/server path."""
+    native = await component_core_client.send_websocket_message(
+        {"type": "repairs/list_issues"}
+    )
+    result = await _overview(component_core_client)
+
+    [native_issue] = native["result"]["issues"]
+    [overview_issue] = result["repairs"]
+    for field, value in native_issue.items():
+        assert overview_issue[field] == value
+    _assert_translated_issue(result, translated_repair)
+
+
+async def test_fallback_keeps_core_fields_and_resolves_native_issue_text(
+    hass: HomeAssistant,
+    core_client: HomeAssistantClient,
+    repairs: None,
+    translated_repair: str,
+) -> None:
+    """The native WebSocket fallback preserves and translates the same row."""
+    websocket_api.async_register_command(hass, websocket_get_translations)
+
+    result = await _overview(core_client)
+
+    _assert_translated_issue(result, translated_repair)
 
 
 async def test_repairs_left_inactive_by_a_restart_are_not_counted(

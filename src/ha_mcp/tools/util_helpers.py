@@ -348,23 +348,6 @@ def raw_ws_refusal(
     return None
 
 
-# Fields surfaced from each repair issue. Includes `ignored` / `dismissed_version`
-# so callers can distinguish active vs. user-dismissed repairs when both are
-# returned (e.g., `include_dismissed_repairs=True`).
-_REPAIR_PROJECTION_FIELDS = (
-    "issue_id",
-    "domain",
-    "severity",
-    "translation_key",
-    "ignored",
-    "dismissed_version",
-    "is_fixable",
-    "breaks_in_ha_version",
-    "created",
-    "issue_domain",
-)
-
-
 def filter_active_repairs(
     issues: list[dict[str, Any]], *, include_dismissed: bool = False
 ) -> list[dict[str, Any]]:
@@ -378,15 +361,6 @@ def filter_active_repairs(
     if include_dismissed:
         return list(issues)
     return [r for r in issues if not r.get("ignored")]
-
-
-def project_repair_fields(issue: dict[str, Any]) -> dict[str, Any]:
-    """Project a repair issue dict to the public-facing field subset.
-
-    Drops verbose fields (`translation_placeholders`, `learn_more_url`) to
-    keep overview payloads compact.
-    """
-    return {k: issue[k] for k in _REPAIR_PROJECTION_FIELDS if k in issue}
 
 
 # Python logging numeric-level → canonical level name.

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
+from homeassistant.components.repairs import websocket_api as repairs_websocket_api
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
 
@@ -25,13 +27,11 @@ from .registry import (
     _iso,
     _iter_config_entries,
     _iter_states,
-    _mapping_values,
     _plainify,
     _reg_entity,
     _reg_name,
     _RegistryView,
     _resolve_registries,
-    _safe,
     _state_as_dict,
     _state_get,
 )
@@ -41,6 +41,7 @@ from .secrets import _load_secret_scrub, _scrub_secret_values
 # All ws_* modules log through the websocket_api logger, so one logger
 # setting covers the whole command surface.
 _LOGGER = logging.getLogger(__package__)
+_TRANSLATION_PLACEHOLDER = re.compile(r"\{(\w+)\}")
 
 
 # =============================================================================
@@ -264,7 +265,70 @@ def _flow_helpers_list(
 # =============================================================================
 # ha_mcp_tools/overview
 # =============================================================================
-def _do_overview(hass: HomeAssistant, params: dict[str, Any]) -> dict[str, Any]:
+async def _overview_prep(hass: HomeAssistant, msg: dict[str, Any]) -> dict[str, Any]:
+    """Load Core's service descriptions and repair translations.
+
+    Both native helpers may load integration files, so they stay in the async
+    prep rather than the synchronous snapshot formatter.
+    """
+    slice_errors: list[str] = []
+    try:
+        from homeassistant.helpers.service import async_get_all_descriptions
+
+        service_descriptions: (
+            Mapping[str, Any] | None
+        ) = await async_get_all_descriptions(hass)
+    except Exception:
+        _LOGGER.warning("overview service descriptions degraded", exc_info=True)
+        service_descriptions = None
+        slice_errors.append("services")
+
+    repair_rows: list[dict[str, Any]] = []
+    repair_translations: Mapping[str, Any] = {}
+    if msg.get("include_repairs", True):
+        try:
+            repair_rows = _overview_repairs(hass)
+        except Exception:
+            _LOGGER.warning("overview repairs degraded", exc_info=True)
+            slice_errors.append("repairs")
+        if repair_rows:
+            try:
+                from homeassistant.helpers.translation import async_get_translations
+
+                domains = {
+                    str(row["domain"])
+                    for row in repair_rows
+                    if row.get("domain") is not None
+                }
+                repair_translations = await async_get_translations(
+                    hass,
+                    getattr(hass.config, "language", None) or "en",
+                    "issues",
+                    domains,
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "overview repair translations degraded; continuing without text",
+                    exc_info=True,
+                )
+                slice_errors.append("repair_translations")
+    return {
+        "service_descriptions": service_descriptions,
+        "repair_rows": repair_rows,
+        "repair_translations": repair_translations,
+        "prep_slice_errors": slice_errors,
+    }
+
+
+def _do_overview(
+    hass: HomeAssistant,
+    params: dict[str, Any],
+    *,
+    service_descriptions: Mapping[str, Any] | None = None,
+    repair_rows: list[dict[str, Any]] | None = None,
+    repair_translations: Mapping[str, Any] | None = None,
+    prep_slice_errors: list[str] | None = None,
+) -> dict[str, Any]:
     """Return the raw in-process reads the server's overview path consumes.
 
     NOT the assembled overview envelope — the RAW slices the server's
@@ -287,7 +351,7 @@ def _do_overview(hass: HomeAssistant, params: dict[str, Any]) -> dict[str, Any]:
     include_repairs = params.get("include_repairs", True)
 
     view = _resolve_registries(hass)
-    slice_errors: list[str] = []
+    slice_errors = list(prep_slice_errors or [])
 
     def _slice(name: str, fn: Any, default: Any) -> Any:
         try:
@@ -299,7 +363,11 @@ def _do_overview(hass: HomeAssistant, params: dict[str, Any]) -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "states": _slice("states", lambda: _overview_states(hass), []),
-        "services": _slice("services", lambda: _overview_services(hass), []),
+        "services": _slice(
+            "services",
+            lambda: _overview_services(hass, service_descriptions),
+            [],
+        ),
         "entity_registry": _slice(
             "entity_registry", lambda: _overview_entity_registry(view), []
         ),
@@ -315,7 +383,14 @@ def _do_overview(hass: HomeAssistant, params: dict[str, Any]) -> dict[str, Any]:
         )
         if include_notifications
         else [],
-        "repairs": _slice("repairs", lambda: _overview_repairs(hass), [])
+        "repairs": _slice(
+            "repairs",
+            lambda: _translate_repairs(
+                repair_rows if repair_rows is not None else _overview_repairs(hass),
+                repair_translations or {},
+            ),
+            [],
+        )
         if include_repairs
         else [],
     }
@@ -345,13 +420,25 @@ def _overview_states(hass: HomeAssistant) -> list[dict[str, Any]]:
     return out
 
 
-def _overview_services(hass: HomeAssistant) -> list[dict[str, Any]]:
+def _overview_services(
+    hass: HomeAssistant, descriptions: Mapping[str, Any] | None = None
+) -> list[dict[str, Any]]:
     """Service catalog in the ``client.get_services()`` list shape.
 
-    The consumer's ``_build_service_stats`` reads only the per-domain service
-    *names*, so each service maps to an empty dict — keeps the frame small while
-    preserving the ``{domain, services: {name: {...}}}`` structure.
+    When Core's descriptions are supplied, preserve each service's native
+    ``target`` metadata; the overview derives controllable entity domains from
+    ``target.entity.domain``. Callers that only need names may omit them.
     """
+    if descriptions is not None:
+        return [
+            {
+                "domain": str(domain),
+                "services": _plainify(dict(domain_services))
+                if isinstance(domain_services, Mapping)
+                else {},
+            }
+            for domain, domain_services in descriptions.items()
+        ]
     services = _call_no_arg(getattr(hass, "services", None), "async_services")
     if not isinstance(services, Mapping):
         return []
@@ -435,34 +522,12 @@ def _overview_area_registry(view: _RegistryView) -> list[dict[str, Any]]:
 
 
 def _overview_config(hass: HomeAssistant) -> dict[str, Any]:
-    """The ``hass.config`` fields the wrapper's ``_fetch_system_info`` reads.
-
-    ``base_url`` is intentionally omitted — the server supplies it from its own
-    client; only HA-core config values are the component's to provide.
-    """
+    """Core's own REST ``/api/config`` serialization, without a copied field list."""
     config = getattr(hass, "config", None)
     raw = _call_no_arg(config, "as_dict")
     if not isinstance(raw, Mapping):
         return {}
-    keys = (
-        "version",
-        "location_name",
-        "time_zone",
-        "language",
-        "state",
-        "country",
-        "currency",
-        "unit_system",
-        "latitude",
-        "longitude",
-        "elevation",
-        "components",
-        "safe_mode",
-        "internal_url",
-        "external_url",
-        "allowlist_external_dirs",
-    )
-    return {k: _plainify(raw[k]) for k in keys if k in raw}
+    return dict(raw)
 
 
 def _overview_notifications(hass: HomeAssistant) -> list[dict[str, Any]]:
@@ -497,40 +562,58 @@ def _notification_values(data: Any) -> list[Any]:
 
 
 def _overview_repairs(hass: HomeAssistant) -> list[dict[str, Any]]:
-    """The issues HA core's ``repairs/list_issues`` lists, with its fields.
+    """Invoke Core's ``repairs/list_issues`` serializer in-process.
 
-    The server filters and projects them itself, as it does core's reply.
-    Like ``ws_list_issues``, it skips inactive entries (the stubs a restart
-    reloads until the integration raises the issue again) and the ones the
-    registry hides (``async_is_hidden``: its config entry is disabled).
-    ``ignored`` is derived from ``dismissed_version``, as core's list does.
+    Core 2026.12's registry already carries ``config_subentry_id`` while its
+    WebSocket row does not yet expose it. Add that one native registry field
+    when present; all existing row fields and visibility rules come directly
+    from Core's handler.
     """
-    registry = _safe(ir.async_get, hass)
-    issues = getattr(registry, "issues", None) if registry is not None else None
-    out: list[dict[str, Any]] = []
-    for issue in _mapping_values(issues):
-        if getattr(issue, "active", True) is False or registry.async_is_hidden(issue):
-            continue
-        dismissed = getattr(issue, "dismissed_version", None)
-        out.append(
-            {
-                "issue_id": getattr(issue, "issue_id", None),
-                "domain": getattr(issue, "domain", None),
-                "severity": _enum_value(getattr(issue, "severity", None)),
-                "translation_key": getattr(issue, "translation_key", None),
-                "translation_placeholders": _plainify(
-                    getattr(issue, "translation_placeholders", None)
-                ),
-                "ignored": dismissed is not None,
-                "dismissed_version": dismissed,
-                "is_fixable": getattr(issue, "is_fixable", None),
-                "breaks_in_ha_version": getattr(issue, "breaks_in_ha_version", None),
-                "created": _iso(getattr(issue, "created", None)),
-                "issue_domain": getattr(issue, "issue_domain", None),
-                "learn_more_url": getattr(issue, "learn_more_url", None),
-            }
-        )
-    return out
+
+    class _ResultCapture:
+        result: dict[str, Any] | None = None
+
+        def send_result(self, _msg_id: int, result: dict[str, Any]) -> None:
+            self.result = result
+
+    capture = _ResultCapture()
+    repairs_websocket_api.ws_list_issues(
+        hass,
+        cast(Any, capture),
+        {"id": 0, "type": "repairs/list_issues"},
+    )
+    rows = list((capture.result or {}).get("issues", []))
+    registry = ir.async_get(hass)
+    for row in rows:
+        issue = registry.async_get_issue(row.get("domain"), row.get("issue_id"))
+        if issue is not None and hasattr(issue, "config_subentry_id"):
+            row.setdefault(
+                "config_subentry_id", getattr(issue, "config_subentry_id", None)
+            )
+    return rows
+
+
+def _translate_repairs(
+    rows: list[dict[str, Any]], translations: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """Add Core's translated issue title/description with native placeholders."""
+    for row in rows:
+        domain = row.get("domain")
+        issue_key = row.get("translation_key") or row.get("issue_id")
+        placeholders = row.get("translation_placeholders")
+        values = placeholders if isinstance(placeholders, Mapping) else {}
+        for field in ("title", "description"):
+            text = translations.get(f"component.{domain}.issues.{issue_key}.{field}")
+            if isinstance(text, str) and text:
+                row[field] = _fill_translation(text, values)
+    return rows
+
+
+def _fill_translation(text: str, values: Mapping[str, Any]) -> str:
+    """Fill known Core translation placeholders and leave unknown ones intact."""
+    return _TRANSLATION_PLACEHOLDER.sub(
+        lambda match: str(values.get(match[1], match[0])), text
+    )
 
 
 # =============================================================================

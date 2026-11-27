@@ -19,7 +19,8 @@ from ..component_api import (
     invalidate_caps,
     is_unknown_command,
 )
-from ..util_helpers import filter_active_repairs, project_repair_fields
+from ..system_health_sections import add_repair_texts
+from ..util_helpers import filter_active_repairs
 from .base import SearchToolsBase
 
 __all__ = [
@@ -368,8 +369,8 @@ class OverviewMixin(SearchToolsBase):
 
         ``prefetched_repairs`` (the component's ``repairs`` slice re-wrapped in the
         ``{success, result: {issues: [...]}}`` envelope) is unwrapped, filtered
-        (``filter_active_repairs``), and projected by the same code as the live
-        fetch when given, skipping the WS call.
+        (``filter_active_repairs``), and returned with Core's fields intact. When
+        given, it skips the WS call; the legacy path adds Core's translated text.
         """
         result["repair_count"] = 0
         result["repairs"] = []
@@ -396,7 +397,10 @@ class OverviewMixin(SearchToolsBase):
                     ) - len(visible_issues)
                     if dismissed_count:
                         result["dismissed_repair_count"] = dismissed_count
-                result["repairs"] = [project_repair_fields(r) for r in visible_issues]
+                result["repairs"] = visible_issues
+                if prefetched_repairs is None and visible_issues:
+                    if warnings := await add_repair_texts(self._client, visible_issues):
+                        result.setdefault("warnings", []).extend(warnings)
             else:
                 err = repairs_result.get("error") or {}
                 err_msg = (

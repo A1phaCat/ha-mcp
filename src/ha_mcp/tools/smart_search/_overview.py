@@ -175,7 +175,11 @@ class SystemOverviewMixin(_SearchBase):
                 domain_stats.items(), key=lambda x: x[1]["count"], reverse=True
             )
             service_stats, total_services = self._build_service_stats(services)
-            ai_insights = self._build_ai_insights(domain_stats, sorted_domains)
+            ai_insights = self._build_ai_insights(
+                domain_stats,
+                sorted_domains,
+                self._target_entity_domains(services),
+            )
             formatted_domain_stats = self._format_domain_stats(
                 sorted_domains, max_entities_per_domain, detail_level, uncap_all
             )
@@ -387,25 +391,66 @@ class SystemOverviewMixin(_SearchBase):
         return service_stats, total_services
 
     @staticmethod
+    def _target_entity_domains(services: Any) -> set[str]:
+        """Entity domains Core marks as service targets in its native catalog."""
+        target_domains: set[str] = set()
+        if not isinstance(services, list):
+            return target_domains
+        for domain_row in services:
+            if not isinstance(domain_row, dict):
+                continue
+            service_domain = domain_row.get("domain")
+            domain_services = domain_row.get("services")
+            if not isinstance(domain_services, dict):
+                continue
+            for description in domain_services.values():
+                target_domains.update(
+                    SystemOverviewMixin._service_target_entity_domains(
+                        description, service_domain
+                    )
+                )
+        return target_domains
+
+    @staticmethod
+    def _service_target_entity_domains(
+        description: Any, service_domain: Any
+    ) -> set[str]:
+        """Read the domain constraint from one Core service target."""
+        if not isinstance(description, dict):
+            return set()
+        target = description.get("target")
+        entity = target.get("entity") if isinstance(target, dict) else None
+        candidates = entity if isinstance(entity, list) else [entity]
+        constraints: list[dict[str, Any]] = [
+            item for item in candidates if isinstance(item, dict)
+        ]
+        if not constraints:
+            return set()
+        domains: set[str] = set()
+        for constraint in constraints:
+            value = constraint.get("domain")
+            if isinstance(value, str):
+                domains.add(value)
+            elif isinstance(value, list):
+                domains.update(domain for domain in value if isinstance(domain, str))
+        if domains:
+            return domains
+        return {service_domain} if isinstance(service_domain, str) else set()
+
+    @staticmethod
     def _build_ai_insights(
         domain_stats: dict[str, dict[str, Any]],
         sorted_domains: list[tuple[str, dict[str, Any]]],
+        target_entity_domains: set[str],
     ) -> dict[str, Any]:
-        """Derive coarse AI-facing hints (common/controllable/monitoring domains)."""
+        """Derive hints from entity counts and Core's native service targets."""
         return {
             "most_common_domains": [domain for domain, _ in sorted_domains[:5]],
-            "controllable_devices": [
-                domain
-                for domain in domain_stats
-                if domain in ["light", "switch", "climate", "media_player", "cover"]
-            ],
-            "monitoring_sensors": [
-                domain
-                for domain in domain_stats
-                if domain in ["sensor", "binary_sensor", "camera"]
-            ],
-            "automation_ready": "automation" in domain_stats
-            and domain_stats["automation"]["count"] > 0,
+            "controllable_devices": sorted(target_entity_domains),
+            "monitoring_sensors": sorted(
+                set(domain_stats).difference(target_entity_domains)
+            ),
+            "automation_ready": "automation" in target_entity_domains,
         }
 
     @staticmethod
